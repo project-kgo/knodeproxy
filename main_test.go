@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,7 @@ func TestLoadConfigReadsYAMLFile(t *testing.T) {
 	if err := os.WriteFile(configFile, []byte(`
 listen:
   addr: ":9090"
+  uds_path: "/tmp/knodeproxy-test.sock"
 etcd:
   endpoints:
     - "127.0.0.1:12379"
@@ -31,6 +33,9 @@ etcd:
 	}
 	if cfg.ListenAddr != ":9090" {
 		t.Fatalf("ListenAddr = %q, want :9090", cfg.ListenAddr)
+	}
+	if cfg.ListenUDSPath != "/tmp/knodeproxy-test.sock" {
+		t.Fatalf("ListenUDSPath = %q, want /tmp/knodeproxy-test.sock", cfg.ListenUDSPath)
 	}
 	if len(cfg.EtcdEndpoints) != 2 || cfg.EtcdEndpoints[0] != "127.0.0.1:12379" || cfg.EtcdEndpoints[1] != "127.0.0.1:22379" {
 		t.Fatalf("EtcdEndpoints = %#v, want two configured endpoints", cfg.EtcdEndpoints)
@@ -64,12 +69,82 @@ listen:
 	}
 }
 
+func TestLoadConfigReadsUDSPathFromEnv(t *testing.T) {
+	resetFlags(t)
+	t.Setenv("KNODEPROXY_LISTEN_UDS_PATH", "/tmp/knodeproxy-env.sock")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if cfg.ListenUDSPath != "/tmp/knodeproxy-env.sock" {
+		t.Fatalf("ListenUDSPath = %q, want /tmp/knodeproxy-env.sock", cfg.ListenUDSPath)
+	}
+}
+
 func TestLoadConfigRejectsNonYAMLFile(t *testing.T) {
 	resetFlags(t)
 	t.Setenv("KNODEPROXY_CONFIG", filepath.Join(t.TempDir(), "knodeproxy.json"))
 	if _, err := loadConfig(); err == nil {
 		t.Fatal("loadConfig() error = nil, want error")
 	}
+}
+
+func TestListenUsesUDSWhenConfigured(t *testing.T) {
+	socketPath := testSocketPath(t, "listen.sock")
+	listener, err := listen(config{ListenAddr: "127.0.0.1:0", ListenUDSPath: socketPath})
+	if err != nil {
+		t.Fatalf("listen() error = %v", err)
+	}
+	defer listener.Close()
+
+	if listener.Addr().Network() != "unix" {
+		t.Fatalf("Network() = %q, want unix", listener.Addr().Network())
+	}
+	if listener.Addr().String() != socketPath {
+		t.Fatalf("Addr() = %q, want %q", listener.Addr().String(), socketPath)
+	}
+}
+
+func TestListenRejectsExistingNonSocketUDSPath(t *testing.T) {
+	socketPath := testSocketPath(t, "regular.sock")
+	if err := os.WriteFile(socketPath, []byte("not a socket"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if _, err := listen(config{ListenUDSPath: socketPath}); err == nil {
+		t.Fatal("listen() error = nil, want error")
+	}
+}
+
+func TestPrepareUDSPathRemovesStaleSocket(t *testing.T) {
+	socketPath := testSocketPath(t, "stale.sock")
+	stale, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	if err := stale.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if err := prepareUDSPath(socketPath); err != nil {
+		t.Fatalf("prepareUDSPath() error = %v", err)
+	}
+	if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
+		t.Fatalf("Stat() error = %v, want not exist", err)
+	}
+}
+
+func testSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "knodeproxy-test-")
+	if err != nil {
+		t.Fatalf("MkdirTemp() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(filepath.Join(dir, name))
+		_ = os.Remove(dir)
+	})
+	return filepath.Join(dir, name)
 }
 
 func resetFlags(t *testing.T) {
